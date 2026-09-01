@@ -351,6 +351,9 @@ export namespace ord {
 
         /** ReactionInput texture */
         texture?: (ord.ITexture|null);
+
+        /** ReactionInput metadata */
+        metadata?: ({ [k: string]: ord.IData }|null);
     }
 
     /**
@@ -412,6 +415,9 @@ export namespace ord {
 
         /** ReactionInput texture. */
         public texture?: (ord.ITexture|null);
+
+        /** ReactionInput metadata. */
+        public metadata: { [k: string]: ord.IData };
 
         /**
          * Creates a new ReactionInput instance using the specified properties.
@@ -2429,6 +2435,9 @@ export namespace ord {
 
         /** ReactionSetup environment */
         environment?: (ord.ReactionSetup.IReactionEnvironment|null);
+
+        /** ReactionSetup metadata */
+        metadata?: ({ [k: string]: ord.IData }|null);
     }
 
     /** Represents a ReactionSetup. */
@@ -2454,6 +2463,9 @@ export namespace ord {
 
         /** ReactionSetup environment. */
         public environment?: (ord.ReactionSetup.IReactionEnvironment|null);
+
+        /** ReactionSetup metadata. */
+        public metadata: { [k: string]: ord.IData };
 
         /**
          * Creates a new ReactionSetup instance using the specified properties.
@@ -2684,6 +2696,9 @@ export namespace ord {
 
         /** ReactionConditions details */
         details?: (string|null);
+
+        /** ReactionConditions metadata */
+        metadata?: ({ [k: string]: ord.IData }|null);
     }
 
     /** Represents a ReactionConditions. */
@@ -2724,6 +2739,9 @@ export namespace ord {
 
         /** ReactionConditions details. */
         public details: string;
+
+        /** ReactionConditions metadata. */
+        public metadata: { [k: string]: ord.IData };
 
         /**
          * Creates a new ReactionConditions instance using the specified properties.
@@ -2814,6 +2832,9 @@ export namespace ord {
 
         /** TemperatureConditions measurements */
         measurements?: (ord.TemperatureConditions.ITemperatureMeasurement[]|null);
+
+        /** TemperatureConditions metadata */
+        metadata?: ({ [k: string]: ord.IData }|null);
     }
 
     /** Represents a TemperatureConditions. */
@@ -2833,6 +2854,9 @@ export namespace ord {
 
         /** TemperatureConditions measurements. */
         public measurements: ord.TemperatureConditions.ITemperatureMeasurement[];
+
+        /** TemperatureConditions metadata. */
+        public metadata: { [k: string]: ord.IData };
 
         /**
          * Creates a new TemperatureConditions instance using the specified properties.
@@ -3178,6 +3202,9 @@ export namespace ord {
 
         /** PressureConditions measurements */
         measurements?: (ord.PressureConditions.IPressureMeasurement[]|null);
+
+        /** PressureConditions metadata */
+        metadata?: ({ [k: string]: ord.IData }|null);
     }
 
     /** Represents a PressureConditions. */
@@ -3200,6 +3227,9 @@ export namespace ord {
 
         /** PressureConditions measurements. */
         public measurements: ord.PressureConditions.IPressureMeasurement[];
+
+        /** PressureConditions metadata. */
+        public metadata: { [k: string]: ord.IData };
 
         /**
          * Creates a new PressureConditions instance using the specified properties.
@@ -3658,6 +3688,9 @@ export namespace ord {
 
         /** StirringConditions rate */
         rate?: (ord.StirringConditions.IStirringRate|null);
+
+        /** StirringConditions metadata */
+        metadata?: ({ [k: string]: ord.IData }|null);
     }
 
     /** Represents a StirringConditions. */
@@ -3677,6 +3710,9 @@ export namespace ord {
 
         /** StirringConditions rate. */
         public rate?: (ord.StirringConditions.IStirringRate|null);
+
+        /** StirringConditions metadata. */
+        public metadata: { [k: string]: ord.IData };
 
         /**
          * Creates a new StirringConditions instance using the specified properties.
@@ -3908,6 +3944,9 @@ export namespace ord {
 
         /** IlluminationConditions distanceToVessel */
         distanceToVessel?: (ord.ILength|null);
+
+        /** IlluminationConditions metadata */
+        metadata?: ({ [k: string]: ord.IData }|null);
     }
 
     /** Represents an IlluminationConditions. */
@@ -3933,6 +3972,9 @@ export namespace ord {
 
         /** IlluminationConditions distanceToVessel. */
         public distanceToVessel?: (ord.ILength|null);
+
+        /** IlluminationConditions metadata. */
+        public metadata: { [k: string]: ord.IData };
 
         /**
          * Creates a new IlluminationConditions instance using the specified properties.
@@ -4057,6 +4099,9 @@ export namespace ord {
 
         /** ElectrochemistryConditions cell */
         cell?: (ord.ElectrochemistryConditions.IElectrochemistryCell|null);
+
+        /** ElectrochemistryConditions metadata */
+        metadata?: ({ [k: string]: ord.IData }|null);
     }
 
     /** Represents an ElectrochemistryConditions. */
@@ -4094,6 +4139,9 @@ export namespace ord {
 
         /** ElectrochemistryConditions cell. */
         public cell?: (ord.ElectrochemistryConditions.IElectrochemistryCell|null);
+
+        /** ElectrochemistryConditions metadata. */
+        public metadata: { [k: string]: ord.IData };
 
         /**
          * Creates a new ElectrochemistryConditions instance using the specified properties.
@@ -4421,6 +4469,9 @@ export namespace ord {
 
         /** FlowConditions tubing */
         tubing?: (ord.FlowConditions.ITubing|null);
+
+        /** FlowConditions metadata */
+        metadata?: ({ [k: string]: ord.IData }|null);
     }
 
     /** Represents a FlowConditions. */
@@ -4443,6 +4494,9 @@ export namespace ord {
 
         /** FlowConditions tubing. */
         public tubing?: (ord.FlowConditions.ITubing|null);
+
+        /** FlowConditions metadata. */
+        public metadata: { [k: string]: ord.IData };
 
         /**
          * Creates a new FlowConditions instance using the specified properties.
@@ -4691,6 +4745,9 @@ export namespace ord {
 
         /** ReactionNotes procedureDetails */
         procedureDetails?: (string|null);
+
+        /** ReactionNotes metadata */
+        metadata?: ({ [k: string]: ord.IData }|null);
     }
 
     /** Represents a ReactionNotes. */
@@ -4728,6 +4785,9 @@ export namespace ord {
 
         /** ReactionNotes procedureDetails. */
         public procedureDetails: string;
+
+        /** ReactionNotes metadata. */
+        public metadata: { [k: string]: ord.IData };
 
         /**
          * Creates a new ReactionNotes instance using the specified properties.
@@ -4948,6 +5008,9 @@ export namespace ord {
 
         /** ReactionWorkup isAutomated */
         isAutomated?: (boolean|null);
+
+        /** ReactionWorkup metadata */
+        metadata?: ({ [k: string]: ord.IData }|null);
     }
 
     /** Represents a ReactionWorkup. */
@@ -4988,6 +5051,9 @@ export namespace ord {
 
         /** ReactionWorkup isAutomated. */
         public isAutomated?: (boolean|null);
+
+        /** ReactionWorkup metadata. */
+        public metadata: { [k: string]: ord.IData };
 
         /**
          * Creates a new ReactionWorkup instance using the specified properties.

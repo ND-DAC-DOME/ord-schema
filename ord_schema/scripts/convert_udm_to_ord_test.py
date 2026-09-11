@@ -43,7 +43,12 @@ SAMPLE_DEPOSITOR = {
 @pytest.fixture(scope="module")
 def dataset():
     """Converts sample_udm.xml once and reuses the result across tests."""
-    return conv.convert(SAMPLE_UDM, **SAMPLE_DEPOSITOR)
+    return conv.convert(
+        SAMPLE_UDM,
+        person_name=SAMPLE_DEPOSITOR["person_name"],
+        email=SAMPLE_DEPOSITOR["email"],
+        created_date=SAMPLE_DEPOSITOR["created_date"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +218,51 @@ def test_combined_amount_string_is_parsed(tmp_path):
     )
     assert reactant.amount.moles.value == pytest.approx(0.3)
     assert reactant.amount.moles.units == reaction_pb2.Moles.MILLIMOLE
+
+
+def test_missing_and_unsupported_amount_units_are_valid(tmp_path):
+    """Unitless AMOUNT defaults to mol; unsupported units remain unmeasured."""
+    xml = textwrap.dedent("""\
+        <?xml version="1.0" encoding="UTF-8"?>
+        <UDM version="6.0.0">
+          <LEGAL><TITLE>Test</TITLE></LEGAL>
+          <MOLECULES>
+            <MOLECULE ID="M1"><NAME>A</NAME></MOLECULE>
+            <MOLECULE ID="M2"><NAME>B</NAME></MOLECULE>
+          </MOLECULES>
+          <REACTIONS>
+            <REACTION ID="R1">
+              <VARIATION ID="V1">
+                <REACTANT>
+                  <MOLECULE MOL_ID="M1"/>
+                  <AMOUNT>1.5</AMOUNT>
+                </REACTANT>
+                <REAGENT>
+                  <MOLECULE MOL_ID="M2"/>
+                  <AMOUNT unit="equiv">2</AMOUNT>
+                </REAGENT>
+                <PRODUCT><MOLECULE MOL_ID="M1"/></PRODUCT>
+              </VARIATION>
+            </REACTION>
+          </REACTIONS>
+        </UDM>
+    """)
+    p = tmp_path / "amount_units.xml"
+    p.write_text(xml)
+    dataset = conv.convert(p)
+
+    unitless = dataset.reactions[0].inputs["M1_REACTANT"].components[0].amount
+    assert unitless.WhichOneof("kind") == "moles"
+    assert unitless.moles.value == pytest.approx(1.5)
+    assert unitless.moles.units == reaction_pb2.Moles.MOLE
+
+    unsupported = dataset.reactions[0].inputs["M2_REAGENT"].components[0].amount
+    assert unsupported.WhichOneof("kind") == "unmeasured"
+    assert unsupported.unmeasured.type == reaction_pb2.UnmeasuredAmount.CUSTOM
+    assert "2" in unsupported.unmeasured.details
+    assert "equiv" in unsupported.unmeasured.details
+    validations.validate_message(unitless)
+    validations.validate_message(unsupported)
 
 
 def test_section_unwrap_maps_inputs_and_products(tmp_path):
@@ -595,7 +645,12 @@ def test_cli_person_name_flag_is_distinct_from_dataset_name(tmp_path):
 
 def test_sample_dataset_validates():
     """The sample UDM file converts to a dataset ORD validation accepts."""
-    dataset = conv.convert(SAMPLE_UDM, **SAMPLE_DEPOSITOR)
+    dataset = conv.convert(
+        SAMPLE_UDM,
+        person_name=SAMPLE_DEPOSITOR["person_name"],
+        email=SAMPLE_DEPOSITOR["email"],
+        created_date=SAMPLE_DEPOSITOR["created_date"],
+    )
     validations.validate_datasets({"_COMBINED": dataset})
 
 
@@ -784,7 +839,7 @@ def test_amount_inline_unit_attribute(tmp_path):
 
 
 def test_multiple_condition_groups_does_not_crash(tmp_path):
-    """Multiple CONDITION_GROUPs must not crash; first group's temperature is used."""
+    """Multiple CONDITION_GROUPs become one dynamic condition profile."""
     xml = textwrap.dedent("""\
         <?xml version="1.0" encoding="UTF-8"?>
         <UDM version="6.0.0">
@@ -810,10 +865,122 @@ def test_multiple_condition_groups_does_not_crash(tmp_path):
     p = tmp_path / "multi_cg.xml"
     p.write_text(xml)
     dataset = conv.convert(p)
-    assert len(dataset.reactions) == 1
-    assert dataset.reactions[0].conditions.temperature.setpoint.value == pytest.approx(
-        80.0
-    )
+    conditions = dataset.reactions[0].conditions
+    assert conditions.conditions_are_dynamic
+    assert not conditions.temperature.HasField("setpoint")
+    assert "Stage 1: temperature 80 c" in conditions.details
+    assert "Stage 2: temperature 100 c" in conditions.details
+
+
+def test_dynamic_condition_groups_preserve_stage_ranges(tmp_path):
+    """Every min/max stage is retained without inventing a static setpoint."""
+    xml = textwrap.dedent("""\
+        <UDM>
+          <LEGAL><TITLE>Test</TITLE></LEGAL>
+          <MOLECULES><MOLECULE ID="M1"><NAME>A</NAME></MOLECULE></MOLECULES>
+          <REACTIONS><REACTION ID="R1"><VARIATION>
+            <REACTANT><MOLECULE MOL_ID="M1"/></REACTANT>
+            <PRODUCT><MOLECULE MOL_ID="M1"/></PRODUCT>
+            <CONDITIONS>
+              <CONDITION_GROUP>
+                <TEMPERATURE><min>20</min><max>20</max></TEMPERATURE>
+                <TIME><min>23</min><max>23</max></TIME>
+              </CONDITION_GROUP>
+              <CONDITION_GROUP>
+                <TEMPERATURE><min>165</min><max>165</max></TEMPERATURE>
+                <TIME><min>5</min><max>5</max></TIME>
+              </CONDITION_GROUP>
+              <CONDITION_GROUP><TIME><exact>6</exact></TIME></CONDITION_GROUP>
+            </CONDITIONS>
+          </VARIATION></REACTION></REACTIONS>
+        </UDM>
+    """)
+    p = tmp_path / "dynamic_ranges.xml"
+    p.write_text(xml)
+    reaction = conv.convert(p).reactions[0]
+
+    assert reaction.conditions.conditions_are_dynamic
+    assert not reaction.conditions.temperature.HasField("setpoint")
+    assert not reaction.outcomes[0].HasField("reaction_time")
+    assert "Stage 1: temperature 20 degC; time 23 hr" in reaction.conditions.details
+    assert "Stage 2: temperature 165 degC; time 5 hr" in reaction.conditions.details
+    assert "Stage 3: time 6 hr" in reaction.conditions.details
+
+
+def test_condition_ranges_and_unmapped_fields_are_preserved(tmp_path):
+    """Ranges map structurally while unsupported condition fields remain as text."""
+    xml = textwrap.dedent("""\
+        <UDM>
+          <LEGAL><TITLE>Test</TITLE></LEGAL>
+          <MOLECULES><MOLECULE ID="M1"><NAME>A</NAME></MOLECULE></MOLECULES>
+          <REACTIONS><REACTION ID="R1"><VARIATION>
+            <REACTANT><MOLECULE MOL_ID="M1"/></REACTANT>
+            <PRODUCT>
+              <MOLECULE MOL_ID="M1"/>
+              <YIELD><min>80</min><max>90</max></YIELD>
+            </PRODUCT>
+            <CONDITIONS><CONDITION_GROUP>
+              <TEMPERATURE>
+                <min>20</min><max>30</max>
+                <incr unit="degC/hour">5</incr>
+              </TEMPERATURE>
+              <STIRRING><min>490</min><max>510</max></STIRRING>
+              <BUFFER_TYPE>phosphate</BUFFER_TYPE>
+              <BUFFER_CONCENTRATION><exact>0.1</exact></BUFFER_CONCENTRATION>
+              <REACTION_MOLARITY><exact>0.5</exact></REACTION_MOLARITY>
+              <TOTAL_VOLUME><exact>10</exact></TOTAL_VOLUME>
+              <REAGENT_ID>R1</REAGENT_ID>
+            </CONDITION_GROUP></CONDITIONS>
+          </VARIATION></REACTION></REACTIONS>
+        </UDM>
+    """)
+    p = tmp_path / "condition_ranges.xml"
+    p.write_text(xml)
+    reaction = conv.convert(p).reactions[0]
+
+    assert reaction.conditions.temperature.setpoint.value == pytest.approx(25)
+    assert reaction.conditions.temperature.setpoint.precision == pytest.approx(5)
+    assert reaction.conditions.stirring.rate.rpm == 500
+    measurement = reaction.outcomes[0].products[0].measurements[0]
+    assert measurement.percentage.value == pytest.approx(85)
+    assert measurement.percentage.precision == pytest.approx(5)
+    details = reaction.conditions.details
+    assert "ramp=5 degc/hour" in details
+    assert "stirring 500±10 rpm" in details
+    assert "buffer type phosphate" in details
+    assert "buffer concentration 0.1 mol/L" in details
+    assert "reaction molarity 0.5 mol/L" in details
+    assert "total volume 10 L" in details
+    assert "reagent id R1" in details
+
+
+def test_lone_and_inverted_condition_bounds(tmp_path):
+    """Lone bounds remain text; inverted complete ranges stay valid."""
+    xml = textwrap.dedent("""\
+        <UDM>
+          <LEGAL><TITLE>Test</TITLE></LEGAL>
+          <MOLECULES><MOLECULE ID="M1"><NAME>A</NAME></MOLECULE></MOLECULES>
+          <REACTIONS><REACTION ID="R1"><VARIATION>
+            <REACTANT><MOLECULE MOL_ID="M1"/></REACTANT>
+            <PRODUCT><MOLECULE MOL_ID="M1"/></PRODUCT>
+            <CONDITIONS><CONDITION_GROUP>
+              <TEMPERATURE><max>100</max></TEMPERATURE>
+              <PRESSURE unit="bar"><min>2</min><max>1</max></PRESSURE>
+              <BUFFER_CONCENTRATION><min unit="mol/L">0.1</min></BUFFER_CONCENTRATION>
+            </CONDITION_GROUP></CONDITIONS>
+          </VARIATION></REACTION></REACTIONS>
+        </UDM>
+    """)
+    p = tmp_path / "condition_bounds.xml"
+    p.write_text(xml)
+    reaction = conv.convert(p).reactions[0]
+
+    assert not reaction.conditions.temperature.HasField("setpoint")
+    assert "temperature <=100 degC" in reaction.conditions.details
+    assert reaction.conditions.pressure.setpoint.value == pytest.approx(1.5)
+    assert reaction.conditions.pressure.setpoint.precision == pytest.approx(0.5)
+    assert "buffer concentration >=0.1 mol/L" in reaction.conditions.details
+    validations.validate_message(reaction.conditions)
 
 
 # ---------------------------------------------------------------------------
@@ -982,7 +1149,7 @@ def test_infinite_amount_is_dropped(tmp_path):
     assert not comp.amount.HasField("volume")
 
 
-def test_nan_temperature_is_skipped(tmp_path):
+def test_invalid_temperature_and_time_are_skipped(tmp_path):
     xml = textwrap.dedent("""\
         <?xml version="1.0" encoding="UTF-8"?>
         <UDM version="6.0.0">
@@ -991,10 +1158,15 @@ def test_nan_temperature_is_skipped(tmp_path):
           <REACTIONS>
             <REACTION ID="R1">
               <VARIATION ID="V1">
+                <REACTANT>
+                  <MOLECULE MOL_ID="M1"/>
+                  <AMOUNT unit="g">1</AMOUNT>
+                </REACTANT>
                 <PRODUCT><MOLECULE MOL_ID="M1"/></PRODUCT>
                 <CONDITIONS>
                   <CONDITION_GROUP>
                     <TEMPERATURE units="c"><exact>nan</exact></TEMPERATURE>
+                    <TIME units="min"><exact>not-a-number</exact></TIME>
                   </CONDITION_GROUP>
                 </CONDITIONS>
               </VARIATION>
@@ -1002,13 +1174,19 @@ def test_nan_temperature_is_skipped(tmp_path):
           </REACTIONS>
         </UDM>
     """)
-    p = tmp_path / "nan_temp.xml"
+    p = tmp_path / "invalid_conditions.xml"
     p.write_text(xml)
-    dataset = conv.convert(p)
-    # Proto default for unset float is 0.0 — confirms value was never assigned.
-    assert dataset.reactions[0].conditions.temperature.setpoint.value == pytest.approx(
-        0.0
+    dataset = conv.convert(
+        p,
+        description="Invalid conditions regression test",
+        email="test@example.com",
+        person_name="Test Scientist",
+        created_date="2024-01-15",
     )
+    reaction = dataset.reactions[0]
+    assert not reaction.conditions.temperature.HasField("setpoint")
+    assert not reaction.outcomes[0].HasField("reaction_time")
+    validations.validate_datasets({"_COMBINED": dataset})
 
 
 # ---------------------------------------------------------------------------
@@ -1404,11 +1582,115 @@ def test_reaction_reactant_id_creates_inputs(tmp_path):
     p = tmp_path / "reactant_id.xml"
     p.write_text(xml)
     dataset = conv.convert(p)
-    assert "1209228_REACTANT" in dataset.reactions[0].inputs
-    reactant = dataset.reactions[0].inputs["1209228_REACTANT"].components[0]
+    assert "REACTANT_IDS" in dataset.reactions[0].inputs
+    reactant = dataset.reactions[0].inputs["REACTANT_IDS"].components[0]
     assert reactant.reaction_role == reaction_pb2.ReactionRole.REACTANT
     assert reactant.identifiers[0].value == "reactant-a"
     assert reactant.amount.WhichOneof("kind") == "unmeasured"
+
+
+def test_reaction_without_variation_uses_shared_reactant_input(tmp_path):
+    """Reaction-level IDs remain recoverable when VARIATION is absent."""
+    xml = textwrap.dedent("""\
+        <UDM>
+          <LEGAL><TITLE>Test</TITLE></LEGAL>
+          <MOLECULES>
+            <MOLECULE ID="R1"><NAME>reactant-a</NAME></MOLECULE>
+            <MOLECULE ID="R2"><NAME>reactant-b</NAME></MOLECULE>
+            <MOLECULE ID="P1"><NAME>product</NAME></MOLECULE>
+          </MOLECULES>
+          <REACTIONS><REACTION ID="RXN">
+            <REACTANT_ID>R1</REACTANT_ID>
+            <REACTANT_ID>R2</REACTANT_ID>
+            <PRODUCT_ID>P1</PRODUCT_ID>
+          </REACTION></REACTIONS>
+        </UDM>
+    """)
+    p = tmp_path / "no_variation_ids.xml"
+    p.write_text(xml)
+    dataset = conv.convert(
+        p,
+        description="No-variation regression test",
+        person_name="Test Scientist",
+        email="test@example.com",
+        created_date="2024-01-15",
+    )
+
+    assert len(dataset.reactions) == 1
+    assert list(dataset.reactions[0].inputs) == ["REACTANT_IDS"]
+    assert len(dataset.reactions[0].inputs["REACTANT_IDS"].components) == 2
+    assert len(dataset.reactions[0].outcomes[0].products) == 1
+    validations.validate_datasets({"_COMBINED": dataset})
+
+
+def test_reaction_without_variation_non_smiles_needs_no_validate(tmp_path):
+    """A non-SMILES identifier-only reaction is emitted but does not validate."""
+    xml = textwrap.dedent("""\
+        <UDM>
+          <LEGAL><TITLE>Test</TITLE></LEGAL>
+          <MOLECULES/>
+          <REACTIONS><REACTION ID="RXN">
+            <RXNSTRUCTURE format="rinchi">RInChI=1.00.1S/</RXNSTRUCTURE>
+          </REACTION></REACTIONS>
+        </UDM>
+    """)
+    p = tmp_path / "no_variation_rinchi.xml"
+    p.write_text(xml)
+    dataset = conv.convert(
+        p,
+        description="Identifier-only regression test",
+        person_name="Test Scientist",
+        email="test@example.com",
+        created_date="2024-01-15",
+    )
+
+    assert len(dataset.reactions) == 1
+    assert dataset.reactions[0].identifiers[0].value == "RInChI=1.00.1S/"
+    with pytest.raises(validations.ValidationError):
+        validations.validate_datasets({"_COMBINED": dataset})
+
+
+def test_include_udm_xml_preserves_reaction_and_parent_context(tmp_path):
+    """Opt-in XML metadata is scoped correctly and does not alter provenance."""
+    xml = textwrap.dedent("""\
+        <UDM>
+          <LEGAL><TITLE>Test</TITLE><DOI>10.1000/global</DOI></LEGAL>
+          <CITATIONS>
+            <CITATION ID="C1"><DOI>10.1000/variation</DOI></CITATION>
+          </CITATIONS>
+          <MOLECULES><MOLECULE ID="M1"><NAME>A</NAME></MOLECULE></MOLECULES>
+          <REACTIONS>
+            <REACTION ID="R1"><VARIATION CIT_ID="C1">
+              <REACTANT><MOLECULE MOL_ID="M1"/></REACTANT>
+              <PRODUCT><MOLECULE MOL_ID="M1"/></PRODUCT>
+            </VARIATION></REACTION>
+            <REACTION ID="R2"><VARIATION>
+              <REACTANT><MOLECULE MOL_ID="M1"/></REACTANT>
+              <PRODUCT><MOLECULE MOL_ID="M1"/></PRODUCT>
+            </VARIATION></REACTION>
+          </REACTIONS>
+        </UDM>
+    """)
+    p = tmp_path / "xml_metadata.xml"
+    p.write_text(xml)
+    dataset = conv.convert(p, include_udm_xml=True)
+    without_xml = conv.convert(p)
+
+    assert dataset.reactions[0].provenance.doi == "10.1000/variation"
+    assert dataset.reactions[1].provenance.doi == "10.1000/global"
+    first = dataset.reactions[0].provenance.reaction_metadata
+    second = dataset.reactions[1].provenance.reaction_metadata
+    assert 'ID="R1"' in first["udm_reaction_xml"].string_value
+    assert 'ID="R2"' in second["udm_reaction_xml"].string_value
+    parent_xml = first["udm_parent_xml"].string_value
+    assert "<LEGAL>" in parent_xml
+    assert "<CITATIONS>" in parent_xml
+    assert "<MOLECULES" not in parent_xml
+    assert "<REACTIONS" not in parent_xml
+    assert not without_xml.reactions[0].provenance.reaction_metadata
+    assert conv.parse_args(
+        ["--input", str(p), "--include-udm-xml"]
+    ).include_udm_xml
 
 
 def test_free_text_preparation_sets_environment_custom(tmp_path):

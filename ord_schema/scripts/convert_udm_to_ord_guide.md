@@ -39,6 +39,7 @@ If `--output` is omitted, the output filename is derived from the `<TITLE>` in t
 | `--orcid TEXT` | _(none)_ | Depositor ORCID iD → provenance `Person.orcid` (no UDM source) |
 | `--email ADDRESS` | UDM `SCIENTIST/EMAIL` | **Fill gap** for depositor email; ORD requires email on `record_created` |
 | `--created-date TEXT` | UDM `CREATION_DATE` | **Fill gap** for `record_created.time`; ORD requires a time |
+| `--include-udm-xml` | off | Embed each source `REACTION` and shared document context in `provenance.reaction_metadata`; enable only when source redistribution is allowed |
 | `--no-validate` | off | Skip ORD schema validation; useful for large batch jobs or partially complete data |
 
 ### CLI precedence (asymmetric on purpose)
@@ -115,6 +116,7 @@ The converter writes a standard ORD `Dataset` protobuf. Each reaction inside it 
 
 - A canonical `reaction_id` (auto-assigned as `ord-<sha256>`)
 - Inputs keyed by `<MOL_ID>_<ROLE>` (e.g., `MOL-1_REACTANT`, `MOL-1_SOLVENT`)
+- Bare reaction-level `REACTANT_ID` references grouped under one `REACTANT_IDS` input
 - Conditions, outcomes, notes, and provenance populated where UDM data is present
 
 To inspect the output:
@@ -202,12 +204,12 @@ Converter and RDKit may print warnings during conversion. Most do **not** stop t
 | `atom … has specified valence (…) smaller than the drawn valence …` | RDKit | Valence annotation disagrees with bonds in the MolBlock | Usually yes; RDKit noise on legacy drawings |
 | `Warning: ambiguous stereochemistry - overlapping neighbors … ignored` | RDKit | Stereo wedge/hash geometry is ambiguous | Usually yes; stereo may be dropped for that atom |
 | `WARNING: not removing hydrogen atom without neighbors` (and similar H cleanup messages) | RDKit | Odd explicit hydrogens in the MolBlock | Usually yes |
-| `Multiple CONDITION_GROUPs found; using the first.` | Converter | UDM has more than one `<CONDITION_GROUP>` under `CONDITIONS` | **Not silent data loss — review it.** Only the **first** group is mapped to ORD. Count how often this appears in the log (common in Reaxys). See [Dropped CONDITION_GROUPs](#dropped-condition_groups-domain-review) |
 | `AMOUNT element has attributes but no text content; skipping.` | Converter | `<AMOUNT units="g"/>` with no value | No — fix the source UDM |
 | `Non-finite AMOUNT value ...; skipping.` | Converter | Amount is `inf`, `nan`, or overflowing float | No — check the source value |
 | `Molecule ... not found in MOLECULES lookup; skipping.` | Converter | `MOL_ID` has no matching `<MOLECULE>` | No — fix dangling references |
 | `MOLSTRUCTURE for ... is not a readable MolBlock; recording NAME instead.` | Converter | RDKit cannot read the structure (often after `H+` / valence / counts-line errors above) | Often yes for conversion; **structure is lost**, molecule `@ID` or name kept as `NAME`. Same mol ID may warn many times if reused across reactions |
-| `Reaction has no VARIATION elements; skipping.` | Converter | `<REACTION>` with no `<VARIATION>` children | Expected for templates; no ORD Reaction emitted |
+| `Unsupported TEMPERATURE unit ...; skipping setpoint.` | Converter | Temperature unit has no ORD mapping | Review — source value is retained only when raw XML embedding is enabled |
+| `Unsupported reaction TIME unit ...; skipping reaction time.` | Converter | Time unit has no ORD mapping | Review — source value is retained only when raw XML embedding is enabled |
 
 To capture warnings (and errors) in a file, redirect **stderr** as well as stdout, e.g. `&> convert.log` or `2>&1 | tee convert.log`.
 
@@ -244,32 +246,24 @@ Literature / ELN exports (especially Reaxys) often omit fields ORD validation re
 | DOI like `10.1016/S0022-328X(00)99569-X` (parentheses in suffix) | Keep the full DOI (`parse_doi` allows `(…)`) | Trimmed forms are regex artifacts and often do not resolve; the published DOI is kept |
 | DOI prefixed with junk (`org/10.1016/…`, URL wrappers) | Normalize via `parse_doi` before writing `provenance.doi` | ORD requires the stored DOI to equal the parsed form |
 | `VARIATION` has reagents but no `<PRODUCT>`; `REACTION` has `<PRODUCT_ID>` | Resolve `PRODUCT_ID` → `MOLECULES` and create an outcome product | ORD requires ≥1 outcome; Reaxys stores products as IDs at reaction level |
-| `VARIATION` has no role compounds; `REACTION` has `<REACTANT_ID>` | Resolve `REACTANT_ID` → `MOLECULES` as `REACTANT` inputs (unmeasured amount) | ORD requires ≥1 input; Reaxys often lists reactants only as IDs |
+| `VARIATION` has no role compounds; `REACTION` has `<REACTANT_ID>` | Resolve every ID through `MOLECULES` as a component of one shared `REACTANT_IDS` input (unmeasured amount) | Bare IDs contain no evidence for separate addition events |
+| `REACTION` has no `<VARIATION>` | Emit one ORD reaction from reaction-level identifiers and ID fallbacks | Legal UDM shape; recover data rather than skip it. Non-SMILES identifier-only records may need `--no-validate` |
 | Free-text `<PREPARATION>` (not a known env keyword) | Set `setup.environment.type=CUSTOM` and put the text in `.details` | ORD requires `type` whenever environment fields are set |
 | Input compound has no `<AMOUNT>` | Set `amount.unmeasured` with `type=CUSTOM`, `details="amount not reported in UDM"` | ORD requires an amount on every input; unmeasured is honest vs inventing a number |
 | `<PRESSURE><exact>…</exact></PRESSURE>` with **no unit** | Do **not** set `pressure.setpoint`; append raw value to `conditions.details` | Reaxys mixes scales (≈760 torr vs large Pa-like numbers); guessing units is unreliable |
 | `<MOLECULE>` has empty `<NAME/>` and no usable `MOLSTRUCTURE` | Use the molecule `@ID` string as a `NAME` identifier | Empty identifier values fail validation; ID preserves a stable handle |
-| Multiple `<CONDITION_GROUP>` siblings | Use the **first only**; log `Multiple CONDITION_GROUPs found; using the first.` once per affected variation. 2nd+ groups are **not** written to ORD (not even into `conditions.details`) | ORD has a single `ReactionConditions` per Reaction — see [Dropped CONDITION_GROUPs](#dropped-condition_groups-domain-review) |
+| Multiple `<CONDITION_GROUP>` siblings | Set `conditions_are_dynamic = true`; summarize every group as a labeled stage in `conditions.details`; leave static setpoints unset | UDM defines siblings as one dynamic multi-stage profile |
 
-### Dropped CONDITION_GROUPs (domain experts to review)
+### Multiple CONDITION_GROUPs
 
-UDM allows several `<CONDITION_GROUP>` children under one `<CONDITIONS>` (e.g. alternate pressure/temperature snapshots in Reaxys). ORD does **not**: each `Reaction` has one `ReactionConditions` message.
+UDM allows several `<CONDITION_GROUP>` children under one `<CONDITIONS>` to describe a dynamic multi-stage profile. ORD has one `ReactionConditions` message with fields intended for this case.
 
 **What the converter does today**
 
-1. Reads the first `<CONDITION_GROUP>` only (temperature, pressure, stirring, …).
-2. Logs a warning for that variation: `Multiple CONDITION_GROUPs found; using the first.`
-3. **Discards** every later group — contents are not copied into `conditions.details`, `conditions_are_dynamic`, outcomes, or notes.
+1. Sets `conditions_are_dynamic = true`.
+2. Writes every group to `conditions.details` as `Stage 1: ...; Stage 2: ...`.
+3. Leaves static temperature, pressure, stirring, pH, and reaction-time fields unset instead of selecting one stage or merging unrelated stages.
 
-**How to review a conversion log**
+Single groups still map supported exact or min/max values structurally. Complete ranges use midpoint + precision; one-sided bounds and unsupported fields such as buffer concentration remain in `conditions.details`.
 
-```bash
-# How many variations lost 2nd+ groups?
-rg -c 'Multiple CONDITION_GROUPs found' convert.log
-```
-
-Each hit ≈ one ORD reaction that may be missing alternate condition sets from the source UDM. Open the matching UDM `<VARIATION>` / `<CONDITIONS>` and check whether the dropped groups were duplicates, alternatives, or multi-stage steps you care about.
-
-**Possible future improvements** (not implemented): merge groups; set `conditions_are_dynamic = true` and summarize extras in `conditions.details`; or emit one ORD reaction per group. Domain experts: comment which behavior you want.
-
-Related: [`udm_to_ord_mapping.md` — Dropped CONDITION_GROUPs](udm_to_ord_mapping.md#dropped-condition_groups-domain-review) · [full policy table](udm_to_ord_mapping.md#converter-policies-for-incomplete-udm-domain-review).
+Related: [`udm_to_ord_mapping.md` — Multiple CONDITION_GROUPs](udm_to_ord_mapping.md#multiple-condition_groups) · [full policy table](udm_to_ord_mapping.md#converter-policies-for-incomplete-udm-domain-review).

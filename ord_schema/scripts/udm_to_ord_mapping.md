@@ -49,7 +49,7 @@ Mapped from `<RXNSTRUCTURE>` elements on the parent `<REACTION>` (shared across 
 
 ## Inputs (`ReactionInput`)
 
-Each `<REACTANT>`, `<REAGENT>`, `<CATALYST>`, `<SOLVENT>` block becomes one `ReactionInput`. The map key in `reaction.inputs` is `<MOL_ID>_<ROLE>` (e.g., `MOL-1_REACTANT`), ensuring the same molecule used in two roles produces two separate input slots.
+Each `<REACTANT>`, `<REAGENT>`, `<CATALYST>`, `<SOLVENT>` block becomes one `ReactionInput`. The map key in `reaction.inputs` is `<MOL_ID>_<ROLE>` (e.g., `MOL-1_REACTANT`), ensuring the same molecule used in two roles produces two separate input slots. When only bare `REACTANT_ID` references are available, all referenced compounds share one `REACTANT_IDS` input because the source does not define separate addition events.
 
 | UDM element | ORD field |
 |---|---|
@@ -68,7 +68,7 @@ Each `<REACTANT>`, `<REAGENT>`, `<CATALYST>`, `<SOLVENT>` block becomes one `Rea
 - Inline attribute: `<AMOUNT unit="g">1.5</AMOUNT>` / `units="g"` (attribute-bearing dict from `etree_to_dict`)
 - Combined string (SURF): `<AMOUNT>0.3000 mmol</AMOUNT>` — value and unit split from the text
 
-Unit strings are matched case-insensitively. Unrecognised units fall back to `mass` with value only. Non-finite values (`inf`, `nan`, overflow) are silently dropped. When no amount element is present at all, the converter sets `UnmeasuredAmount` (`CUSTOM`, details `"amount not reported in UDM"`) so ORD validation passes.
+Unit strings are matched case-insensitively. A unitless `AMOUNT` defaults to `mol`, as specified by the UDM `molType`. An unsupported unit is stored as `UnmeasuredAmount` (`CUSTOM`) with the original numeric value and unit in `details`; it is not assigned an arbitrary physical quantity type. Non-finite values (`inf`, `nan`, overflow) are silently dropped. When no amount element is present at all, the converter sets `UnmeasuredAmount` (`CUSTOM`, details `"amount not reported in UDM"`) so ORD validation passes.
 
 **Mass units:** `g`, `mg`, `ug`/`µg`, `kg`
 **Moles units:** `mol`, `mmol`, `umol`/`µmol`, `nmol`
@@ -88,35 +88,33 @@ A `<MOLSTRUCTURE>` that RDKit cannot read at all is not recorded as a `MOLBLOCK`
 
 Mapped from `VARIATION/CONDITIONS/CONDITION_GROUP`, or from `VARIATION/CONDITIONS` directly when there is no `CONDITION_GROUP` (SURF).
 
-### Dropped CONDITION_GROUPs (domain experts to review)
+### Multiple CONDITION_GROUPs
 
 ORD models conditions as **one** `ReactionConditions` per `Reaction` (`reaction.conditions = 4` in the proto — not `repeated`). UDM may list several sibling `<CONDITION_GROUP>` elements (common in Reaxys literature exports).
 
 | Step | Behavior |
 |---|---|
-| Select group | **First** `<CONDITION_GROUP>` only |
-| Log | `Multiple CONDITION_GROUPs found; using the first.` (converter `WARNING`, once per variation) |
-| 2nd, 3rd, … groups | **Dropped entirely** — not mapped to structured ORD fields and **not** summarized into `conditions.details` / `conditions_are_dynamic` today |
+| One group | Map supported fields structurally; preserve unsupported fields and one-sided bounds in `conditions.details` |
+| Two or more groups | Set `conditions_are_dynamic = true`; write every group as a labeled stage in `conditions.details` |
+| Structured setpoints for dynamic conditions | Leave unset; selecting or merging one stage would misrepresent the source |
 
-This is intentional given the schema, but it is **lossy**. Domain experts should treat a high warning count in convert logs as a signal to spot-check whether discarded groups held distinct conditions (e.g. a second pressure/temperature regime) vs redundant copies.
-
-See also [What is not converted](#what-is-not-converted) and the user guide section [Dropped CONDITION_GROUPs](convert_udm_to_ord_guide.md#dropped-condition_groups-domain-review).
+UDM documents multiple groups as a dynamic multi-stage profile rather than independent reactions. ORD's `conditions_are_dynamic` and catch-all `details` fields represent that case without duplicating outcomes or fabricating a static composite.
 
 SURF nests reactants/products/conditions under `VARIATION/SECTION`; the converter promotes those children to variation level before mapping (existing top-level keys win).
 
 | UDM element | ORD field | Notes |
 |---|---|---|
-| `TEMPERATURE/@unit(s)` + `TEMPERATURE/exact` | `conditions.temperature.setpoint` | Units: `c`/`°c`/`degC`, `f`/`°f`, `k`. Missing unit → Celsius |
-| `PRESSURE/@unit(s)` + `PRESSURE/exact` | `conditions.pressure.setpoint` | Units: `atm`, `bar`, `psi`, `kpsi`, `torr`. **No unit → setpoint omitted**; raw value appended to `conditions.details` |
+| `TEMPERATURE/@unit(s)` + exact or min/max | `conditions.temperature.setpoint` | A complete range maps to midpoint + precision. Units: `c`/`°c`/`degC`, `f`/`°f`, `k`. Missing unit → Celsius |
+| `PRESSURE/@unit(s)` + exact or min/max | `conditions.pressure.setpoint` | A complete range maps to midpoint + precision. Units: `atm`, `bar`, `psi`, `kpsi`, `torr`. **No unit → setpoint omitted**; raw value appended to `conditions.details` |
 | `PRESSURE/ATMOSPHERE` | `conditions.pressure.atmosphere.type` | `air`, `n2`/`nitrogen`, `ar`/`argon`, `o2`/`oxygen`, `h2`/`hydrogen`, `co`, `co2` |
 | `STIRRING` (text) | `conditions.stirring.details` + `.type` + `.rate.rpm` | See [Stirring](#stirring) |
 | `REFLUX` | `conditions.reflux` | True when value is `true`, `yes`, or `1` |
-| `PH/exact` or `<PH>7.0</PH>` | `conditions.ph` | Plain-string and nested forms both supported |
+| `PH` exact or min/max; `<PH>7.0</PH>` | `conditions.ph` | Complete ranges use the midpoint; the range remains in `details` because ORD pH has no precision field |
 | `PREPARATION` | `setup.environment.type` or `.details` | Known values: `fume hood`, `bench top`, `glove box`, `glove bag`; unknown → `CUSTOM` + `.details` |
 | `VESSEL/VESSEL_TYPE` | `setup.vessel.type` | `round bottom flask`/`rbf`, `vial`, `well plate`, `tube`, `microwave vial`, `nmr tube`, `pressure flask`, `pressure reactor` |
 | `VESSEL/DETAILS` | `setup.vessel.details` | |
 
-All numeric condition values guard against non-finite floats (`inf`, `nan`); the field is left unset if the value is non-finite.
+All numeric condition values guard against non-finite floats (`inf`, `nan`); value and units are assigned together. A lone `min` or `max` is retained as a labeled bound (`>=` / `<=`) in `details`, never fabricated as an exact value.
 
 ### Stirring
 
@@ -142,10 +140,10 @@ An outcome is only created when the variation has a parseable `<DURATION>` (dict
 
 | UDM element | ORD field | Notes |
 |---|---|---|
-| `DURATION` / `CONDITIONS/.../TIME` + `exact` | `outcome.reaction_time` | Units: `h`/`hr`, `min`, `s`/`sec`. Missing unit → hour |
+| `DURATION` / `CONDITIONS/.../TIME` exact or min/max | `outcome.reaction_time` | Complete range maps to midpoint + precision. Units: `h`/`hr`, `min`, `s`/`sec`. Missing unit → hour |
 | `PRODUCT/MOLECULE/@MOL_ID` | `outcome.products[].identifiers` | Via molecule lookup |
 | `REACTION/PRODUCT_ID` or `VARIATION/PRODUCT_ID` | `outcome.products[].identifiers` | Used when no `PRODUCT` blocks (Reaxys); resolved via `MOLECULES` |
-| `PRODUCT/YIELD/exact` or `<YIELD>85</YIELD>` | `outcome.products[].measurements[].percentage` | type = `YIELD`; non-finite values skipped |
+| `PRODUCT/YIELD` exact or min/max; `<YIELD>85</YIELD>` | `outcome.products[].measurements[].percentage` | Complete range maps to midpoint + precision; lone bound goes to measurement `details`; non-finite values skipped |
 
 ---
 
@@ -203,19 +201,17 @@ The `_text()` helper extracts `#text` from such dicts, falling back to a plain s
 
 Text is stripped for every tag except those in `_RAW_TEXT_TAGS` (currently `MOLSTRUCTURE`), whose whitespace is significant; see [Molecule identifiers](#molecule-identifiers).
 
+With `--include-udm-xml`, each ORD reaction stores its source `<REACTION>` element as `provenance.reaction_metadata["udm_reaction_xml"]` and shared document context (`UDM_VERSION`, `LEGAL`, `ORGANISATIONS`, `CITATIONS`, etc.) as `"udm_parent_xml"`. `REACTIONS` and the potentially large `MOLECULES` lookup are excluded from parent context. This is opt-in because source XML may have a different license.
+
 ---
 
 ## What is not converted
 
-ORD models conditions as a **single** `ReactionConditions` message per `Reaction` (not a list of condition groups). UDM can carry several `<CONDITION_GROUP>` siblings; this converter keeps only the first and logs a warning. Multi-stage detail is not written into `conditions.details` / `conditions_are_dynamic` today. Full policy: [Dropped CONDITION_GROUPs](#dropped-condition_groups-domain-review).
-
 | UDM element / case | Reason |
 |---|---|
-| 2nd+ `<CONDITION_GROUP>` under `CONDITIONS` | ORD has one `ReactionConditions` per Reaction; converter uses the first group only; **later groups discarded with a log warning** (not copied to `details`) |
 | `<RXNSTRUCTURE format="cdxml">` value | CDX binary embedded in XML; no ORD SMILES equivalent |
 | `<ANALYSIS>`, `<SPECTRUM>` | ORD `Analysis` proto exists but not yet wired up |
 | `<SCALE>` | No direct ORD equivalent |
-| Parallel multi-stage condition narrative beyond the first group | Not flattened into `conditions.details` / `conditions_are_dynamic` |
 | `<PRESSURE>` value without a unit attribute | Not mapped to `pressure.setpoint` (unit inference unreliable); raw value may appear in `conditions.details` |
 | `<MODIFICATION_DATE>` nested structures | Plain strings and simple lists are handled; unusual nesting may vary |
 
@@ -229,11 +225,12 @@ Policies applied when UDM is missing fields that ORD validation still requires. 
 |---|---|---|
 | Elsevier-style DOI with `(…)` in the suffix; URL or `org/…` prefixes | `provenance.doi` must equal `parse_doi(doi)` | `parse_doi` keeps parenthetical suffixes; converter normalizes via `parse_doi` before storing |
 | Products only as `REACTION/PRODUCT_ID` (or `VARIATION/PRODUCT_ID`), no `<PRODUCT>` block | ≥1 `ReactionOutcome` | Resolve IDs through `MOLECULES` into outcome products when no `PRODUCT` blocks exist |
-| Reactants only as `REACTION/REACTANT_ID` (or `VARIATION/REACTANT_ID`), no role blocks | ≥1 reaction input | Resolve IDs through `MOLECULES` as `REACTANT` inputs when no role blocks exist |
+| Reactants only as `REACTION/REACTANT_ID` (or `VARIATION/REACTANT_ID`), no role blocks | ≥1 reaction input | Resolve all IDs through `MOLECULES` as components of one shared `REACTANT_IDS` input |
+| `REACTION` has no `VARIATION` | Preserve recoverable reaction-level data | Emit one ORD reaction using reaction-level identifiers and `REACTANT_ID` / `PRODUCT_ID` fallbacks. A non-SMILES identifier-only record may require `--no-validate` |
 | Free-text `PREPARATION` used as environment details | `ReactionEnvironment.type` required if message non-empty | Set `type=CUSTOM` with the free text in `details` |
 | Role compound without `AMOUNT` / `SAMPLE_MASS` / `VOLUME` | Every input component needs an `Amount` | `UnmeasuredAmount` with `type=CUSTOM` and details `"amount not reported in UDM"` |
 | `PRESSURE/exact` without `@unit` / `@units` | If setpoint `value` is set, `units` is required | Omit setpoint; record `UDM PRESSURE exact=… (unit omitted; not mapped to setpoint)` in `conditions.details` |
 | Empty `MOLECULE/NAME` and no readable `MOLSTRUCTURE` | Identifier `value` must be non-empty | Use molecule `@ID` as `NAME` |
-| Several `CONDITION_GROUP`s | One `ReactionConditions` message | **First group only**; log warning; 2nd+ groups dropped with no `details` summary — see [Dropped CONDITION_GROUPs](#dropped-condition_groups-domain-review) |
+| Several `CONDITION_GROUP`s | One `ReactionConditions` message | Set `conditions_are_dynamic`; summarize every group as a stage in `details` — see [Multiple CONDITION_GROUPs](#multiple-condition_groups) |
 
 See also the user-facing summary in [`convert_udm_to_ord_guide.md`](convert_udm_to_ord_guide.md#converter-policies-for-incomplete-udm-domain-review).

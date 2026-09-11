@@ -22,6 +22,7 @@ Example usage:
 
 import argparse
 import contextlib
+import copy
 import math
 import pathlib
 import re
@@ -243,6 +244,134 @@ def _attr_unit(node: dict, *keys: str) -> str:
     return ""
 
 
+def _finite_float(value: object) -> float | None:
+    """Returns a finite float parsed from an XML value, or None."""
+    with contextlib.suppress(ValueError, TypeError):
+        parsed = float(_text(value))
+        if math.isfinite(parsed):
+            return parsed
+    return None
+
+
+def _parse_range(value: object) -> tuple[float, float | None] | None:
+    """Returns (midpoint, precision) for a UDM exact/min/max range.
+
+    Lone bounds cannot be represented structurally in ORD and return None.
+    Inverted complete ranges are normalized before calculating precision.
+    """
+    if not isinstance(value, dict):
+        parsed = _finite_float(value)
+        return (parsed, None) if parsed is not None else None
+    mapping = cast("dict[str, object]", value)
+    if "exact" in mapping:
+        parsed = _finite_float(mapping["exact"])
+        return (parsed, None) if parsed is not None else None
+    minimum = _finite_float(mapping.get("min"))
+    maximum = _finite_float(mapping.get("max"))
+    if minimum is None or maximum is None:
+        return None
+    low, high = sorted((minimum, maximum))
+    precision = (high - low) / 2
+    return (low + precision, precision or None)
+
+
+_CONDITION_DEFAULT_UNITS = {
+    "TEMPERATURE": "degC",
+    "TIME": "hr",
+    "STIRRING": "rpm",
+    "REACTION_MOLARITY": "mol/L",
+    "BUFFER_CONCENTRATION": "mol/L",
+    "TOTAL_VOLUME": "L",
+}
+
+
+def _format_number(value: float) -> str:
+    """Formats a numeric condition value compactly."""
+    return f"{value:g}"
+
+
+def _format_range_text(value: dict, default_unit: str = "") -> str | None:
+    """Formats a UDM range, including lone bounds, for condition details."""
+    unit = _attr_unit(value, "@unit", "@units") or default_unit
+    parsed = _parse_range(value)
+    if parsed is not None:
+        midpoint, precision = parsed
+        text = _format_number(midpoint)
+        if precision is not None:
+            text += f"±{_format_number(precision)}"
+    else:
+        minimum = _finite_float(value.get("min"))
+        maximum = _finite_float(value.get("max"))
+        if minimum is not None:
+            text = f">={_format_number(minimum)}"
+        elif maximum is not None:
+            text = f"<={_format_number(maximum)}"
+        else:
+            return None
+    return f"{text} {unit}".strip()
+
+
+def _format_detail_value(value: object, *, default_unit: str = "") -> str:
+    """Formats an XML-derived scalar, list, range, or nested dictionary."""
+    if isinstance(value, list):
+        return ", ".join(
+            text
+            for item in value
+            if (text := _format_detail_value(item, default_unit=default_unit))
+        )
+    if isinstance(value, dict):
+        mapping = cast("dict[str, object]", value)
+        range_text = _format_range_text(mapping, default_unit)
+        if range_text is not None:
+            increment = _format_detail_value(mapping.get("incr"))
+            return (
+                f"{range_text}; ramp={increment}" if increment else range_text
+            )
+        text = _text(mapping)
+        if text:
+            unit = _attr_unit(mapping, "@unit", "@units")
+            return f"{text} {unit}".strip()
+        return ", ".join(
+            f"{key.lstrip('@')}={formatted}"
+            for key, item in mapping.items()
+            if key != "SECTION"
+            and (formatted := _format_detail_value(item))
+        )
+    return _text(value).strip()
+
+
+def _condition_group_details(
+    group: dict,
+    *,
+    exclude: frozenset[str] = frozenset(),
+) -> str:
+    """Formats CONDITION_GROUP fields not represented structurally."""
+    parts = []
+    for key, value in group.items():
+        if key in exclude or key == "SECTION" or key.startswith("@"):
+            continue
+        formatted = _format_detail_value(
+            value,
+            default_unit=_CONDITION_DEFAULT_UNITS.get(key, ""),
+        )
+        if formatted:
+            parts.append(f"{key.lower().replace('_', ' ')} {formatted}")
+    return "; ".join(parts)
+
+
+def _append_condition_details(
+    pb2_reaction: reaction_pb2.Reaction,
+    details: str,
+) -> None:
+    """Appends non-empty text to ReactionConditions.details."""
+    if not details:
+        return
+    if pb2_reaction.conditions.details:
+        pb2_reaction.conditions.details += f"; {details}"
+    else:
+        pb2_reaction.conditions.details = details
+
+
 # SURF / literature exports often write "<AMOUNT>0.3000 mmol</AMOUNT>".
 _COMBINED_AMOUNT_RE = re.compile(
     r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([A-Za-zµμ°]+)\s*$"
@@ -257,8 +386,16 @@ def _split_combined_amount(text: str) -> tuple[str, str] | None:
     return match.group(1), match.group(2)
 
 
-def _parse_amount(value_str: object, unit_str: object) -> reaction_pb2.Amount | None:
+def _parse_amount(
+    value_str: object,
+    unit_str: object,
+    *,
+    default_unit: str = "",
+) -> reaction_pb2.Amount | None:
     """Converts a (value, unit) pair from UDM into an ORD Amount.
+
+    Unknown units are preserved in a CUSTOM unmeasured amount instead of being
+    assigned an incorrect physical quantity type.
 
     Returns None if the value cannot be parsed as a finite float.
     """
@@ -293,7 +430,10 @@ def _parse_amount(value_str: object, unit_str: object) -> reaction_pb2.Amount | 
         logger.warning("Non-finite AMOUNT value %r; skipping.", value_str)
         return None
 
-    unit_key = str(unit_str).strip().lower() if unit_str else ""
+    unit_text = _text(unit_str).strip() if unit_str else ""
+    if not unit_text:
+        unit_text = default_unit
+    unit_key = unit_text.lower()
 
     amount = reaction_pb2.Amount()
     if unit_key in _MASS_UNITS:
@@ -306,8 +446,13 @@ def _parse_amount(value_str: object, unit_str: object) -> reaction_pb2.Amount | 
         amount.volume.value = value
         amount.volume.units = _VOLUME_UNITS[unit_key]
     else:
-        # Unknown or absent unit: store as mass with value only so data is not lost.
-        amount.mass.value = value
+        amount.unmeasured.type = reaction_pb2.UnmeasuredAmount.CUSTOM
+        if unit_text:
+            amount.unmeasured.details = (
+                f"UDM amount {value:g} has unsupported unit {unit_text!r}"
+            )
+        else:
+            amount.unmeasured.details = f"UDM amount {value:g} has no unit"
     return amount
 
 
@@ -318,7 +463,12 @@ def _compound_amount(compound_entry: dict) -> reaction_pb2.Amount | None:
         if raw is None:
             continue
         unit_raw = compound_entry.get("AMOUNT_UNIT") or compound_entry.get("UNIT")
-        parsed = _parse_amount(raw, unit_raw)
+        # UDM molType defaults AMOUNT to mol when its unit is omitted.
+        parsed = _parse_amount(
+            raw,
+            unit_raw,
+            default_unit="mol" if key == "AMOUNT" else "",
+        )
         if parsed is not None:
             return parsed
     return None
@@ -560,10 +710,11 @@ def _map_inputs(
     reactant_ids = _mol_ids_from(variation, "REACTANT_ID")
     if not reactant_ids and reaction is not None:
         reactant_ids = _mol_ids_from(reaction, "REACTANT_ID")
+    if not reactant_ids:
+        return
+    molinput = pb2_reaction.inputs["REACTANT_IDS"]
     for mol_id in reactant_ids:
         molval = all_molecules.get(mol_id)
-        input_key = f"{mol_id}_REACTANT"
-        molinput = pb2_reaction.inputs[input_key]
         molcomponent = molinput.components.add()
         if molval is not None:
             _add_compound_identifier(molcomponent, molval, mol_id=mol_id)
@@ -589,26 +740,35 @@ _CONDITION_FIELDS = frozenset(
         "ATMOSPHERE",
         "PREPARATION",
         "VESSEL",
+        "PROCESS",
+        "REACTION_MOLARITY",
+        "BUFFER_TYPE",
+        "BUFFER_CONCENTRATION",
+        "TOTAL_VOLUME",
+        "REACTANT_ID",
+        "REAGENT_ID",
+        "CATALYST_ID",
+        "SOLVENT_ID",
     }
 )
 
 
-def _condition_group(conditions: dict) -> dict:
-    """Returns the condition-field dict for a UDM CONDITIONS element.
+def _condition_groups(conditions: dict) -> list[dict]:
+    """Returns condition groups, including SURF's unwrapped representation.
 
-    Prefers CONDITION_GROUP when present. SURF places TEMPERATURE/TIME directly
-    under CONDITIONS with no CONDITION_GROUP wrapper.
+    Strict UDM uses one or more CONDITION_GROUP children. SURF places condition
+    fields directly under CONDITIONS without that wrapper.
     """
-    cg_raw = conditions.get("CONDITION_GROUP")
-    if isinstance(cg_raw, list):
-        if len(cg_raw) > 1:
-            logger.warning("Multiple CONDITION_GROUPs found; using the first.")
-        cg_raw = cg_raw[0] if cg_raw else {}
-    if isinstance(cg_raw, dict) and cg_raw:
-        return cg_raw
+    groups = [
+        group
+        for group in _as_list(conditions.get("CONDITION_GROUP"))
+        if isinstance(group, dict) and group
+    ]
+    if groups:
+        return groups
     if _CONDITION_FIELDS & conditions.keys():
-        return conditions
-    return {}
+        return [conditions]
+    return []
 
 
 def _map_conditions(
@@ -619,55 +779,68 @@ def _map_conditions(
     conditions = variation.get("CONDITIONS") or {}
     if not isinstance(conditions, dict):
         return
-    # Failure 2: normalise multiple CONDITION_GROUPs to the first entry.
-    cg = _condition_group(conditions)
-    if not cg:
+    groups = _condition_groups(conditions)
+    if not groups:
         return
+    if len(groups) > 1:
+        pb2_reaction.conditions.conditions_are_dynamic = True
+        for index, group in enumerate(groups, start=1):
+            details = _condition_group_details(group)
+            _append_condition_details(
+                pb2_reaction,
+                f"Stage {index}: {details or '(no data)'}",
+            )
+        return
+    cg = groups[0]
+    captured: set[str] = set()
 
-    # Temperature — Failure 7: guard against non-finite values.
+    # Temperature: value and units are assigned atomically.
     temp = cg.get("TEMPERATURE")
     if isinstance(temp, dict):
-        exact = temp.get("exact")
-        if exact is not None:
-            with contextlib.suppress(ValueError, TypeError):
-                val = float(exact)
-                if math.isfinite(val):
-                    pb2_reaction.conditions.temperature.setpoint.value = val
+        parsed = _parse_range(temp)
         unit_key = _attr_unit(temp, "@unit", "@units")
-        if unit_key in _TEMP_UNITS:
-            pb2_reaction.conditions.temperature.setpoint.units = _TEMP_UNITS[unit_key]
-        elif pb2_reaction.conditions.temperature.setpoint.HasField("value"):
+        units = _TEMP_UNITS.get(unit_key)
+        if units is None and not unit_key:
             # SURF omits unit; Celsius is the lab default for these exports.
-            pb2_reaction.conditions.temperature.setpoint.units = (
-                reaction_pb2.Temperature.CELSIUS
+            units = reaction_pb2.Temperature.CELSIUS
+        if parsed is not None and units is not None:
+            value, precision = parsed
+            setpoint = pb2_reaction.conditions.temperature.setpoint
+            setpoint.value = value
+            setpoint.units = units
+            if precision is not None:
+                setpoint.precision = precision
+            if "incr" not in temp:
+                captured.add("TEMPERATURE")
+        elif parsed is not None:
+            logger.warning(
+                "Unsupported TEMPERATURE unit %r; skipping setpoint.",
+                unit_key,
             )
 
-    # Pressure — Failure 7: guard against non-finite values.
     # Reaxys often omits units and mixes scales (torr vs Pa vs atm); guessing is
     # unreliable, so setpoint is only written when a recognised unit is present.
     # The raw number is preserved in conditions.details for domain review.
     pressure = cg.get("PRESSURE")
     if isinstance(pressure, dict):
-        exact = pressure.get("exact")
+        parsed = _parse_range(pressure)
         unit_key = _attr_unit(pressure, "@unit", "@units")
-        if exact is not None:
-            with contextlib.suppress(ValueError, TypeError):
-                val = float(exact)
-                if math.isfinite(val):
-                    if unit_key in _PRESSURE_UNITS:
-                        pb2_reaction.conditions.pressure.setpoint.value = val
-                        pb2_reaction.conditions.pressure.setpoint.units = (
-                            _PRESSURE_UNITS[unit_key]
-                        )
-                    else:
-                        note = (
-                            f"UDM PRESSURE exact={val} "
-                            "(unit omitted; not mapped to setpoint)"
-                        )
-                        if pb2_reaction.conditions.details:
-                            pb2_reaction.conditions.details += f"; {note}"
-                        else:
-                            pb2_reaction.conditions.details = note
+        if parsed is not None and unit_key in _PRESSURE_UNITS:
+            value, precision = parsed
+            setpoint = pb2_reaction.conditions.pressure.setpoint
+            setpoint.value = value
+            setpoint.units = _PRESSURE_UNITS[unit_key]
+            if precision is not None:
+                setpoint.precision = precision
+            captured.add("PRESSURE")
+        elif parsed is not None and not unit_key:
+            value, _ = parsed
+            _append_condition_details(
+                pb2_reaction,
+                f"UDM PRESSURE value={value:g} "
+                "(unit omitted; not mapped to setpoint)",
+            )
+            captured.add("PRESSURE")
 
     # ATMOSPHERE is a CONDITION_GROUP sibling in UDM v6 (legacy: under PRESSURE).
     atm_raw = (
@@ -681,25 +854,24 @@ def _map_conditions(
     )
     if atm_raw in _ATMOSPHERE_TYPES:
         pb2_reaction.conditions.pressure.atmosphere.type = _ATMOSPHERE_TYPES[atm_raw]
+        captured.add("ATMOSPHERE")
 
     # Stirring — schema uses stirringRange; older files may use free text.
     stirring = cg.get("STIRRING")
     if isinstance(stirring, dict):
-        exact = stirring.get("exact")
+        parsed = _parse_range(stirring)
         unit_key = _attr_unit(stirring, "@unit", "@units") or "rpm"
-        if exact is not None:
-            with contextlib.suppress(ValueError, TypeError):
-                rpm_val = float(exact)
-                if math.isfinite(rpm_val):
-                    pb2_reaction.conditions.stirring.rate.rpm = int(rpm_val)
-                    pb2_reaction.conditions.stirring.details = (
-                        f"{int(rpm_val)} {unit_key}"
-                    )
-        pb2_reaction.conditions.stirring.type = (
-            reaction_pb2.StirringConditions.CUSTOM
-            if pb2_reaction.conditions.stirring.details
-            else reaction_pb2.StirringConditions.UNSPECIFIED
-        )
+        if parsed is not None and unit_key == "rpm":
+            rpm_value, precision = parsed
+            rpm = round(rpm_value)
+            if 0 <= rpm <= 2**31 - 1:
+                pb2_reaction.conditions.stirring.type = (
+                    reaction_pb2.StirringConditions.CUSTOM
+                )
+                pb2_reaction.conditions.stirring.rate.rpm = rpm
+                pb2_reaction.conditions.stirring.details = f"{rpm} rpm"
+                if precision is None:
+                    captured.add("STIRRING")
     elif stirring is not None:
         text = str(stirring)
         pb2_reaction.conditions.stirring.details = text
@@ -712,6 +884,7 @@ def _map_conditions(
         rpm_match = re.search(r"(\d+)\s*rpm", lowered)
         if rpm_match:
             pb2_reaction.conditions.stirring.rate.rpm = int(rpm_match.group(1))
+        captured.add("STIRRING")
 
     # Reflux
     reflux_raw = cg.get("REFLUX")
@@ -721,20 +894,23 @@ def _map_conditions(
             "yes",
             "1",
         )
+        captured.add("REFLUX")
 
-    # pH — Failure 12: accept plain string; Failure 7: guard non-finite.
+    # pH accepts either a range dictionary or a plain string.
     ph = cg.get("PH")
-    if isinstance(ph, dict):
-        exact = ph.get("exact")
-    elif ph is not None:
-        exact = ph  # plain string like "7.0"
-    else:
-        exact = None
-    if exact is not None:
-        with contextlib.suppress(ValueError, TypeError):
-            val = float(exact)
-            if math.isfinite(val):
-                pb2_reaction.conditions.ph = val
+    parsed_ph = _parse_range(ph) if ph is not None else None
+    if parsed_ph is not None:
+        value, precision = parsed_ph
+        pb2_reaction.conditions.ph = value
+        if precision is None:
+            captured.add("PH")
+
+    time_value = cg.get("TIME")
+    if isinstance(time_value, dict):
+        parsed_time = _parse_range(time_value)
+        unit_key = _attr_unit(time_value, "@unit", "@units")
+        if parsed_time is not None and (not unit_key or unit_key in _TIME_UNITS):
+            captured.add("TIME")
 
     # Setup environment from CONDITION_GROUP PREPARATION when it matches a known env.
     prep_raw = cg.get("PREPARATION")
@@ -752,6 +928,8 @@ def _map_conditions(
                 reaction_pb2.ReactionSetup.ReactionEnvironment.CUSTOM
             )
             pb2_reaction.setup.environment.details = str(preparation)
+    if preparations:
+        captured.add("PREPARATION")
 
     # Vessel
     vessel_raw = cg.get("VESSEL") or variation.get("VESSEL")
@@ -763,10 +941,18 @@ def _map_conditions(
         details = vessel_raw.get("DETAILS")
         if details:
             pb2_reaction.setup.vessel.details = str(details)
+        if vessel_type is not None or details:
+            captured.add("VESSEL")
     elif vessel_raw:
         vessel_type = _VESSEL_TYPES.get(str(vessel_raw).strip().lower())
         if vessel_type is not None:
             pb2_reaction.setup.vessel.type = vessel_type
+            captured.add("VESSEL")
+
+    _append_condition_details(
+        pb2_reaction,
+        _condition_group_details(cg, exclude=frozenset(captured)),
+    )
 
 
 def _map_notes(variation: dict, pb2_reaction: reaction_pb2.Reaction) -> None:
@@ -808,8 +994,10 @@ def _condition_time(variation: dict) -> dict | None:
     conditions = variation.get("CONDITIONS") or {}
     if not isinstance(conditions, dict):
         return None
-    cg = _condition_group(conditions)
-    time_node = cg.get("TIME")
+    groups = _condition_groups(conditions)
+    if len(groups) != 1:
+        return None
+    time_node = groups[0].get("TIME")
     if isinstance(time_node, dict):
         return time_node
     return None
@@ -857,18 +1045,26 @@ def _map_outcomes(
 
     # Reaction time — Failure 7: guard non-finite. UDM v6 uses CONDITIONS/TIME.
     if isinstance(duration, dict):
-        dur_val = duration.get("exact") or duration.get("value")
-        unit_key = _attr_unit(duration, "@unit", "@units")
-        if dur_val is not None:
-            with contextlib.suppress(ValueError, TypeError):
-                val = float(dur_val)
-                if math.isfinite(val):
-                    outcome.reaction_time.value = val
-            if unit_key in _TIME_UNITS:
-                outcome.reaction_time.units = _TIME_UNITS[unit_key]
-            elif outcome.reaction_time.HasField("value"):
-                # SURF omits unit; hour is the usual duration scale in these exports.
-                outcome.reaction_time.units = reaction_pb2.Time.HOUR
+        parsed = _parse_range(duration)
+        if parsed is None and "value" in duration:
+            parsed = _parse_range(duration["value"])
+        if parsed is not None:
+            unit_key = _attr_unit(duration, "@unit", "@units")
+            units = _TIME_UNITS.get(unit_key)
+            if units is None and not unit_key:
+                # SURF omits units; hour is the usual scale in these exports.
+                units = reaction_pb2.Time.HOUR
+            if units is not None:
+                value, precision = parsed
+                outcome.reaction_time.value = value
+                outcome.reaction_time.units = units
+                if precision is not None:
+                    outcome.reaction_time.precision = precision
+            else:
+                logger.warning(
+                    "Unsupported reaction TIME unit %r; skipping reaction time.",
+                    unit_key,
+                )
 
     # Products from VARIATION/PRODUCT blocks.
     for udm_product in product_entries:
@@ -894,22 +1090,24 @@ def _map_outcomes(
 
         yield_data = udm_product.get("YIELD")
         if yield_data is not None:
-            yield_val = (
-                yield_data.get("exact") if isinstance(yield_data, dict) else yield_data
-            )
-            if yield_val is not None:
-                # Failure 7: add() only after confirming a finite value.
-                y: float | None = None
-                with contextlib.suppress(ValueError, TypeError):
-                    raw_y = float(yield_val)
-                    if math.isfinite(raw_y):
-                        y = raw_y
-                if y is not None:
+            parsed = _parse_range(yield_data)
+            if parsed is not None:
+                value, precision = parsed
+                measurement = product.measurements.add()
+                measurement.type = (
+                    reaction_pb2.ProductMeasurement.ProductMeasurementType.YIELD
+                )
+                measurement.percentage.value = value
+                if precision is not None:
+                    measurement.percentage.precision = precision
+            elif isinstance(yield_data, dict):
+                details = _format_range_text(yield_data, "percent")
+                if details:
                     measurement = product.measurements.add()
                     measurement.type = (
                         reaction_pb2.ProductMeasurement.ProductMeasurementType.YIELD
                     )
-                    measurement.percentage.value = y
+                    measurement.details = f"yield {details}"
 
     # Reaxys-style PRODUCT_ID fallback when no PRODUCT blocks were present.
     for mol_id in product_ids:
@@ -1097,6 +1295,36 @@ def _validation_flag_hints(error_text: str) -> str:
     return "Hint:\n" + "\n".join(f"  • {h}" for h in hints)
 
 
+def _document_context_xml(root: ET.Element) -> str:
+    """Serializes shared UDM context without mutating the parsed source tree."""
+    context = ET.Element(root.tag, root.attrib)
+    for child in root:
+        if child.tag not in ("REACTIONS", "MOLECULES"):
+            context.append(copy.deepcopy(child))
+    return ET.tostring(context, encoding="unicode")
+
+
+def _set_xml_metadata(
+    pb2_reaction: reaction_pb2.Reaction,
+    *,
+    reaction_xml: str,
+    parent_xml: str,
+) -> None:
+    """Stores opt-in UDM source XML on reaction provenance."""
+    reaction_data = pb2_reaction.provenance.reaction_metadata["udm_reaction_xml"]
+    reaction_data.string_value = reaction_xml
+    reaction_data.format = "xml"
+    reaction_data.description = (
+        "Raw UDM REACTION element from which this ORD Reaction was converted."
+    )
+    parent_data = pb2_reaction.provenance.reaction_metadata["udm_parent_xml"]
+    parent_data.string_value = parent_xml
+    parent_data.format = "xml"
+    parent_data.description = (
+        "Shared UDM document context excluding REACTIONS and MOLECULES."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main conversion logic
 # ---------------------------------------------------------------------------
@@ -1112,6 +1340,7 @@ def convert(
     orcid: str = "",
     email: str = "",
     created_date: str = "",
+    include_udm_xml: bool = False,
 ) -> dataset_pb2.Dataset:
     """Parses a UDM XML file and returns an ORD Dataset.
 
@@ -1131,6 +1360,8 @@ def convert(
         created_date: Depositor record-created timestamp; fills only when UDM
             has no CREATION_DATE (UDM wins if both present). ORD validation
             requires record_created.time.
+        include_udm_xml: Whether to embed reaction and shared document XML in
+            provenance.reaction_metadata.
 
     Returns:
         A populated dataset_pb2.Dataset.
@@ -1178,14 +1409,26 @@ def convert(
 
     all_molecules = _build_molecule_lookup(udm)
     pb2_reactions: list[reaction_pb2.Reaction] = []
+    reactions_element = root.find("REACTIONS")
+    if reactions_element is None:
+        logger.error("<REACTIONS> element not found in %s", input_path)
+        sys.exit(1)
+    parent_xml = _document_context_xml(root) if include_udm_xml else ""
 
     # Failure 10: <REACTIONS/> (self-closing) produces None, not {}.
-    for reaction in _as_list((udm["REACTIONS"] or {}).get("REACTION")):
+    for reaction_element in reactions_element.findall("REACTION"):
+        reaction = etree_to_dict(reaction_element)["REACTION"]
+        reaction_xml = (
+            ET.tostring(reaction_element, encoding="unicode")
+            if include_udm_xml
+            else ""
+        )
         _map_rxn_identifiers(reaction, _scratch := reaction_pb2.Reaction())
         rxn_identifiers = _scratch.identifiers[:]  # carry forward to each variation
 
-        for variation in _as_list(reaction.get("VARIATION")):
-            variation = _variation_with_section(variation)
+        variations = _as_list(reaction.get("VARIATION")) or [{}]
+        for raw_variation in variations:
+            variation = _variation_with_section(raw_variation)
             pb2_reaction = reaction_pb2.Reaction()
 
             # Copy reaction-level identifiers into each variation's Reaction.
@@ -1211,11 +1454,14 @@ def convert(
                 email=email,
                 created_date=created_date,
             )
+            if include_udm_xml:
+                _set_xml_metadata(
+                    pb2_reaction,
+                    reaction_xml=reaction_xml,
+                    parent_xml=parent_xml,
+                )
 
             pb2_reactions.append(pb2_reaction)
-
-        if not _as_list(reaction.get("VARIATION")):
-            logger.warning("Reaction has no VARIATION elements; skipping.")
 
     dataset = dataset_pb2.Dataset(
         name=dataset_name,
@@ -1288,6 +1534,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "record_created.",
     )
     parser.add_argument(
+        "--include-udm-xml",
+        action="store_true",
+        help=(
+            "Embed source REACTION XML and shared document context in "
+            "provenance.reaction_metadata. Off by default because source XML "
+            "may have a different license."
+        ),
+    )
+    parser.add_argument(
         "--no-validate",
         action="store_true",
         help="Skip ORD schema validation of the converted dataset.",
@@ -1307,6 +1562,7 @@ def main(args: argparse.Namespace) -> None:
         orcid=args.orcid,
         email=args.email,
         created_date=args.created_date,
+        include_udm_xml=args.include_udm_xml,
     )
 
     # Failure 9: catch ValidationError and exit cleanly instead of showing a traceback.
